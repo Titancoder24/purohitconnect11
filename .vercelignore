@@ -1,0 +1,10 @@
+node_modules
+artifacts
+.git
+dist
+dist-*
+.expo
+.env*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
