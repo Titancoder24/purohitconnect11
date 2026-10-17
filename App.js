@@ -1,4 +1,4 @@
-import React, { Component, useEffect, useRef, useState } from "react";
+import React, { Component, useEffect, useMemo, useRef, useState } from "react";
 import { StatusBar } from "expo-status-bar";
 import { NavigationContainer, DefaultTheme, createNavigationContainerRef } from "@react-navigation/native";
 import { createNativeStackNavigator } from "@react-navigation/native-stack";
@@ -9,14 +9,17 @@ import { House, CalendarDays, MessagesSquare, CircleUserRound, ChartNoAxesCombin
 import * as Linking2 from "expo-linking";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { AuthProvider, useAuth } from "./src/lib/auth";
-import { registerForPush } from "./src/lib/notifications";
 import { colors, font } from "./src/lib/theme";
 import { useI18n } from "./src/lib/i18n";
 import { isWeb, webMaxWidth } from "./src/lib/webLayout";
 import { PreferencesProvider } from "./src/lib/preferences";
+import { AppearanceProvider, useAppearance } from "./src/lib/appearance";
+import { bindBrandStyles } from "./src/lib/brandStyles";
 import AppTopBar from "./src/components/AppTopBar";
 import BrandLogo from "./src/components/BrandLogo";
 import DAPWidget from "./src/components/DAPWidget";
+import IncomingCall from "./src/components/IncomingCall";
+import NotificationBridge from "./src/components/NotificationBridge";
 import LoadingScreen from "./src/components/LoadingScreen";
 import RolePicker from "./src/screens/RolePicker";
 import Login from "./src/screens/Login";
@@ -35,10 +38,12 @@ import PriestOnboarding from "./src/screens/priest/Onboarding";
 import Chat from "./src/screens/customer/Chat";
 import TrackPriest from "./src/screens/customer/TrackPriest";
 import ShareLocation from "./src/screens/priest/ShareLocation";
+import RateCard from "./src/screens/priest/RateCard";
 import Conversation from "./src/screens/Conversation";
 import CallRoom from "./src/screens/CallRoom";
 import Inbox from "./src/screens/Inbox";
 import Settings from "./src/screens/Settings";
+import Notifications from "./src/screens/Notifications";
 import { startMobileSession, trackMobileEvent } from "./src/lib/supabase";
 
 const RootStack = createNativeStackNavigator();
@@ -66,16 +71,21 @@ class WidgetBoundary extends Component {
   }
 }
 
-const navTheme = {
-  ...DefaultTheme,
-  colors: { ...DefaultTheme.colors, background: colors.cotton, primary: colors.brandOrange, card: colors.white, text: colors.ink, border: colors.warmBorder },
-};
+function navigationTheme(accent) {
+  return {
+    ...DefaultTheme,
+    colors: { ...DefaultTheme.colors, background: colors.cotton, primary: accent, card: colors.white, text: colors.ink, border: colors.warmBorder },
+  };
+}
 
 // Deep-link config: purohith://booking/<id>, purohith://priests
 const linking = {
-  prefixes: [Linking2.createURL("/"), "purohith://", "https://purohithconnect.com", "https://bookingg.purohithconnect.com", "https://prohit-connect-one.vercel.app"],
+  prefixes: [Linking2.createURL("/"), "purohith://", "https://bookingg.purohithconnect.com", "https://purohithconnect.com"],
   config: {
     screens: {
+      RolePicker: "",
+      Login: "login",
+      PriestOnboarding: "priest/onboarding",
       Tabs: {
         screens: {
           Home: "home",
@@ -90,7 +100,6 @@ const linking = {
       },
       PriestList: "priests",
       PriestDetail: "priests/:priestId",
-      PriestDetailBySlug: "purohits/:priestSlug",
       Booking: "book/:priestId",
       RequestPooja: "request-pooja",
       RequestProposals: {
@@ -99,11 +108,13 @@ const linking = {
           requestId: String,
         },
       },
+      Notifications: "notifications",
     },
   },
 };
 
 function TabIcon({ focused, Icon }) {
+  const { tokens } = useAppearance();
   const scale = useRef(new Animated.Value(1)).current;
   useEffect(() => {
     Animated.sequence([
@@ -112,8 +123,8 @@ function TabIcon({ focused, Icon }) {
     ]).start();
   }, [focused, scale]);
   return <Animated.View style={[styles.tabIcon, { transform: [{ scale }] }]}> 
-    <Icon size={24} color={focused ? colors.brandOrangeDark : "#70706C"} strokeWidth={focused ? 2.7 : 2.1} />
-    <View style={[styles.tabDot, focused && styles.tabDotActive]} />
+    <Icon size={24} color={focused ? tokens.accent : "#70706C"} strokeWidth={focused ? 2.7 : 2.1} />
+    <View style={[styles.tabDot, focused && { backgroundColor: tokens.accent }]} />
   </Animated.View>;
 }
 
@@ -172,7 +183,7 @@ function PriestTabs() {
   );
 }
 
-const styles = {
+const styles = bindBrandStyles({
   tabBar: { backgroundColor: colors.white, borderTopColor: colors.warmBorder, borderTopWidth: 1, height: Platform.OS === "ios" ? 82 : 72, paddingBottom: Platform.OS === "ios" ? 18 : 8, paddingTop: 7, elevation: 0, shadowOpacity: 0 },
   tabBarItem: { alignItems: "center", justifyContent: "center", paddingTop: 0, paddingBottom: 0, ...(Platform.OS === "web" ? { outlineStyle: "none" } : {}) },
   sceneDesktop: { paddingTop: 70, backgroundColor: colors.white },
@@ -190,16 +201,13 @@ const styles = {
   splashSub: { marginTop: 6, color: colors.muted2, fontSize: 12, lineHeight: 17, fontWeight: "600", textAlign: "center" },
   splashLine: { width: 164, height: 4, overflow: "hidden", borderRadius: 8, marginTop: 22, backgroundColor: "#F0EAE3" },
   splashLineFill: { flex: 1, borderRadius: 8, backgroundColor: colors.brandOrange },
-};
+});
 
 function Router() {
   const { ready, user, role } = useAuth();
+  const { tokens } = useAppearance();
+  const navTheme = useMemo(() => navigationTheme(tokens.accent), [tokens.accent]);
   const routeNameRef = useRef();
-
-  // Register for push notifications once we have an authenticated user.
-  useEffect(() => {
-      if (user) registerForPush().catch((e) => console.warn("push init failed", e?.message));
-  }, [user]);
 
   useEffect(() => {
     startMobileSession().catch((e) => console.warn("analytics session failed", e?.message));
@@ -227,6 +235,7 @@ function Router() {
       }}
     >
       <RootStack.Navigator
+        key={user ? `app:${user.role}` : role ? `login:${role}` : "role-picker"}
         screenOptions={({ navigation }) => ({
           headerShown: false,
           contentStyle: { backgroundColor: colors.cotton },
@@ -235,6 +244,8 @@ function Router() {
           headerTintColor: colors.ink,
           headerTitleStyle: { fontSize: 16, fontWeight: "700" },
           headerBackTitleVisible: false,
+          headerTitleAlign: "center",
+          headerTopInsetEnabled: true,
           headerLeft: ({ canGoBack }) =>
             canGoBack ? (
               <Pressable
@@ -260,7 +271,6 @@ function Router() {
             <RootStack.Screen name="Tabs" component={CustomerTabs} />
             <RootStack.Screen name="PriestList" component={PriestList} options={{ headerShown: false }} />
             <RootStack.Screen name="PriestDetail" component={PriestDetail} options={{ headerShown: true, title: "" }} />
-            <RootStack.Screen name="PriestDetailBySlug" component={PriestDetail} options={{ headerShown: true, title: "" }} />
             <RootStack.Screen name="Booking" component={Booking} options={{ headerShown: true, title: "Book" }} />
             <RootStack.Screen name="RequestPooja" component={RequestPooja} options={{ headerShown: true, title: "Request proposals" }} />
             <RootStack.Screen name="RequestProposals" component={RequestProposals} options={{ headerShown: true, title: "Compare proposals" }} />
@@ -268,24 +278,30 @@ function Router() {
             <RootStack.Screen name="Conversation" component={Conversation} options={{ headerShown: false }} />
             <RootStack.Screen name="CallRoom" component={CallRoom} options={{ headerShown: false }} />
             <RootStack.Screen name="Settings" component={Settings} options={{ headerShown: true, title: "Settings" }} />
+            <RootStack.Screen name="Notifications" component={Notifications} options={{ headerShown: true, title: "Notifications" }} />
           </>
         )}
-        {user && user.role === "priest" && user.onboardingRequired && (
-          <RootStack.Screen name="PriestOnboarding" component={PriestOnboarding} />
-        )}
-        {user && user.role === "priest" && !user.onboardingRequired && (
+        {user && user.role === "priest" && (
           <>
             <RootStack.Screen name="Tabs" component={PriestTabs} />
             <RootStack.Screen name="PriestOnboarding" component={PriestOnboarding} options={{ headerShown: true, title: "Profile" }} />
             <RootStack.Screen name="ShareLocation" component={ShareLocation} options={{ headerShown: true, title: "Share location" }} />
+            <RootStack.Screen name="RateCard" component={RateCard} options={{ headerShown: true, title: "Pooja rate card" }} />
             <RootStack.Screen name="Conversation" component={Conversation} options={{ headerShown: false }} />
             <RootStack.Screen name="CallRoom" component={CallRoom} options={{ headerShown: false }} />
             <RootStack.Screen name="Settings" component={Settings} options={{ headerShown: true, title: "Settings" }} />
+            <RootStack.Screen name="Notifications" component={Notifications} options={{ headerShown: true, title: "Notifications" }} />
           </>
         )}
       </RootStack.Navigator>
       <WidgetBoundary>
         <DAPWidget navigationRef={navigationRef} />
+      </WidgetBoundary>
+      <WidgetBoundary>
+        <IncomingCall navigationRef={navigationRef} />
+      </WidgetBoundary>
+      <WidgetBoundary>
+        <NotificationBridge navigationRef={navigationRef} />
       </WidgetBoundary>
     </NavigationContainer>
   );
@@ -368,9 +384,11 @@ export default function App() {
   return (
     <SafeAreaProvider>
       <PreferencesProvider>
+      <AppearanceProvider>
       <AuthProvider>
         <AuthAppFrame />
       </AuthProvider>
+      </AppearanceProvider>
       </PreferencesProvider>
     </SafeAreaProvider>
   );

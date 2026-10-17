@@ -1,19 +1,28 @@
 import React, { useCallback, useEffect, useState } from "react";
-import { Alert, Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { bindBrandStyles } from "../../lib/brandStyles";
+import { Alert, Pressable, RefreshControl, ScrollView, Text, TextInput, View } from "react-native";
 import { BadgeIndianRupee, Check, Clock3, MapPin, Navigation, Send, Sparkles } from "lucide-react-native";
 import { colors } from "../../lib/theme";
 import { useAuth } from "../../lib/auth";
 import MapplsDrawer from "../../components/MapplsDrawer";
 import { listProviderRequests, sendProviderProposal } from "../../lib/payments";
+import { fetchMarketplaceSettings } from "../../lib/marketplace";
 
-const DEMO_REQUESTS = [
-  { id: "market-griha", pooja_name: "Griha Pravesh Puja", ceremony_date: "2026-08-18", ceremony_time: "09:00", address: "12 Temple Street, Indiranagar, Bengaluru", landmark: "Near Eshwara Temple", lat: 12.9784, lng: 77.6408, notes: "New home; need samagri guidance.", budget_min: 3500, budget_max: 6500, my_bid_status: null },
-  { id: "market-satya", pooja_name: "Satyanarayana Puja", ceremony_date: "2026-08-20", ceremony_time: "07:30", address: "44 South End Road, Jayanagar, Bengaluru", landmark: "Apartment gate B", lat: 12.9299, lng: 77.5826, notes: "Family ceremony for 12 people.", budget_min: 2500, budget_max: 4500, my_bid_status: null },
+const futureDate = (days) => {
+  const d = new Date();
+  d.setDate(d.getDate() + days);
+  return d.toISOString().slice(0, 10);
+};
+
+const getDemoRequests = () => [
+  { id: "market-griha", pooja_name: "Griha Pravesh Puja", ceremony_date: futureDate(2), ceremony_time: "09:00", address: "12 Temple Street, Indiranagar, Bengaluru", landmark: "Near Eshwara Temple", lat: 12.9784, lng: 77.6408, notes: "New home; need samagri guidance.", budget_min: 3500, budget_max: 6500, my_bid_status: null },
+  { id: "market-satya", pooja_name: "Satyanarayana Puja", ceremony_date: futureDate(4), ceremony_time: "07:30", address: "44 South End Road, Jayanagar, Bengaluru", landmark: "Apartment gate B", lat: 12.9299, lng: 77.5826, notes: "Family ceremony for 12 people.", budget_min: 2500, budget_max: 4500, my_bid_status: null },
 ];
 
 export default function Marketplace() {
   const { user } = useAuth();
   const [items, setItems] = useState([]);
+  const [biddingEnabled, setBiddingEnabled] = useState(false);
   const [quotes, setQuotes] = useState({});
   const [messages, setMessages] = useState({});
   const [samagri, setSamagri] = useState({});
@@ -22,10 +31,18 @@ export default function Marketplace() {
   const [mapTarget, setMapTarget] = useState(null);
 
   const load = useCallback(async () => {
-    if (user?.demo) return setItems(DEMO_REQUESTS);
+    const settings = await fetchMarketplaceSettings().catch(() => ({}));
+    setBiddingEnabled(settings.bidding_enabled === true);
+    if (settings.bidding_enabled !== true) return setItems([]);
+    if (user?.demo) return setItems(getDemoRequests());
     try {
       const data = await listProviderRequests(user?.id);
-      setItems(data.requests || []);
+      const todayStr = new Date().toISOString().slice(0, 10);
+      const activeRequests = (data.requests || []).filter((req) => {
+        if (req.ceremony_date && req.ceremony_date < todayStr) return false;
+        return true;
+      });
+      setItems(activeRequests);
     } catch (_) { setItems([]); }
   }, [user?.demo, user?.id]);
 
@@ -51,6 +68,7 @@ export default function Marketplace() {
     } finally { setSending(""); }
   };
 
+  if (!biddingEnabled) return <View style={[styles.root, { flex: 1, justifyContent: "center", padding: 24 }]}><Text style={styles.title}>Fixed-price bookings are on</Text><Text style={styles.sub}>Customers find you through your profile, service areas, availability and published pooja rates. Keep your rate card current to receive direct bookings.</Text></View>;
   return <>
   <ScrollView style={styles.root} contentContainerStyle={styles.content} refreshControl={<RefreshControl refreshing={refreshing} onRefresh={async () => { setRefreshing(true); await load(); setRefreshing(false); }} tintColor={colors.saffron} />}>
     <View style={styles.hero}>
@@ -104,7 +122,7 @@ export default function Marketplace() {
   </>;
 }
 
-const styles = StyleSheet.create({
+const styles = bindBrandStyles({
   root: { flex: 1, backgroundColor: colors.white }, content: { padding: 20, paddingBottom: 40 },
   hero: { flexDirection: "row", gap: 14, paddingVertical: 12, paddingBottom: 24, borderBottomWidth: 1, borderColor: colors.warmBorder },
   heroIcon: { width: 44, height: 44, borderRadius: 22, backgroundColor: "#FFF1EB", alignItems: "center", justifyContent: "center" },

@@ -1,16 +1,21 @@
 import React, { useRef } from "react";
+import { bindBrandStyles } from "../lib/brandStyles";
 import { Animated, Platform, View, Text, StyleSheet, Pressable, ActivityIndicator } from "react-native";
 import { colors, radii, font, spacing } from "../lib/theme";
 import { spiritualTap } from "../lib/spiritualSounds";
+import { useAppearance } from "../lib/appearance";
 
-export function Button({ title, onPress, variant = "primary", disabled, loading, testID, style, icon: Icon }) {
+export function Button({ title, onPress, variant = "primary", disabled, loading, testID, style, icon: Icon, compact }) {
+  const { tokens } = useAppearance();
   const press = useRef(new Animated.Value(0)).current;
+  const themed = variant === "primary" || variant === "outline" || variant === "ghost";
   const bg = disabled ? colors.warmBorder :
-    variant === "primary" ? colors.brandBrown :
+    variant === "primary" ? tokens.primaryBg :
     variant === "danger" ? colors.danger :
     variant === "ghost" ? "transparent" : colors.white;
-  const fg = variant === "outline" || variant === "ghost" ? colors.brandBrown : colors.white;
-  const border = variant === "outline" ? { borderWidth: 1, borderColor: "#D7A9B2" } : {};
+  const fg = disabled ? colors.ink : variant === "outline" || variant === "ghost" ? tokens.primary : variant === "primary" ? tokens.primaryFg : variant === "danger" ? colors.white : colors.ink;
+  const border = variant === "outline" ? { borderWidth: 1, borderColor: tokens.primary } : variant === "primary" && tokens.buttonStyle !== "solid" ? { borderWidth: 1, borderColor: tokens.primaryBorder } : {};
+  const radius = themed ? tokens.radius : radii.md;
   const dimensional = variant === "primary" || variant === "danger";
   const animate = (toValue) => Animated.spring(press, { toValue, speed: 32, bounciness: toValue ? 0 : 7, useNativeDriver: true }).start();
   const animatedStyle = { transform: [{ scale: press.interpolate({ inputRange: [0, 1], outputRange: [1, .975] }) }] };
@@ -33,9 +38,13 @@ export function Button({ title, onPress, variant = "primary", disabled, loading,
         marginBottom: extra.marginBottom,
         marginLeft: extra.marginLeft,
         marginRight: extra.marginRight,
-        padding: "0 20px",
-        borderRadius: radii.md,
-        border: variant === "outline" ? "1px solid #D7A9B2" : "1px solid transparent",
+        flex: extra.flex,
+        maxWidth: extra.maxWidth,
+        minWidth: 0,
+        whiteSpace: "nowrap",
+        padding: compact ? "0 12px" : "0 20px",
+        borderRadius: radius,
+        border: variant === "outline" ? `1px solid ${tokens.primary}` : variant === "primary" && tokens.buttonStyle !== "solid" ? `1px solid ${tokens.primaryBorder}` : variant === "secondary" ? `1px solid ${colors.warmBorder}` : "1px solid transparent",
         background: bg,
         color: fg,
         display: "inline-flex",
@@ -46,9 +55,9 @@ export function Button({ title, onPress, variant = "primary", disabled, loading,
         opacity: disabled || loading ? .65 : 1,
         fontSize: font.sizes.base,
         fontWeight: 700,
-        boxShadow: dimensional ? `0 4px 9px ${variant === "danger" ? "#7F1D1D33" : `${colors.brandBrownDark}33`}` : "none",
+        boxShadow: dimensional ? `0 4px 9px ${variant === "danger" ? "#7F1D1D33" : `${tokens.primary}33`}` : "none",
       }}
-    >{loading ? "Loading..." : <>{Icon ? <Icon size={18} color={fg} strokeWidth={2.2} /> : null}<span>{title}</span></>}</div>;
+    >{loading ? "Loading..." : <>{Icon ? <Icon size={18} color={fg} strokeWidth={2.2} /> : null}<span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{title}</span></>}</div>;
   }
   return (
     <Animated.View style={[animatedStyle, style]}><Pressable
@@ -59,10 +68,10 @@ export function Button({ title, onPress, variant = "primary", disabled, loading,
       onPressIn={() => animate(1)}
       onPressOut={() => animate(0)}
       disabled={disabled || loading}
-      style={({ pressed }) => [styles.btn, dimensional && styles.dimensional, variant === "danger" && styles.dangerDepth, { backgroundColor: bg, opacity: pressed ? 0.9 : 1 }, pressed && dimensional && styles.dimensionalPressed, border]}>
+      style={({ pressed }) => [styles.btn, compact && styles.btnCompact, dimensional && styles.dimensional, variant === "danger" && styles.dangerDepth, variant === "secondary" && styles.secondaryBtn, { backgroundColor: bg, borderRadius: radius, opacity: pressed ? 0.9 : 1 }, pressed && dimensional && styles.dimensionalPressed, border]}>
       {loading ? <ActivityIndicator color={fg} /> : <>
         {Icon ? <Icon size={18} color={fg} strokeWidth={2.2} /> : null}
-        <Text style={[styles.btnTxt, { color: fg }]}>{title}</Text>
+        <Text style={[styles.btnTxt, { color: fg }]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.8}>{title}</Text>
       </>}
     </Pressable></Animated.View>
   );
@@ -75,7 +84,7 @@ export function Card({ children, style, testID }) {
 export function Pill({ label, tone = "neutral", style }) {
   const palette = {
     neutral: { bg: colors.muted, fg: colors.muted2 },
-    saffron: { bg: "#FED7AA", fg: colors.saffronDark },
+    saffron: { bg: colors.accentTint, fg: colors.saffronDark },
     green: { bg: "#DCFCE7", fg: colors.success },
     blue: { bg: "#DBEAFE", fg: colors.info },
     danger: { bg: "#FEE2E2", fg: colors.danger },
@@ -96,32 +105,37 @@ export function SectionHeader({ title, subtitle }) {
   );
 }
 
-export function Field({ label, required = false, children, style }) {
+export const Field = React.forwardRef(function Field({ label, required = false, children, style, error, errorTestID }, ref) {
   return (
-    <View style={[{ marginBottom: spacing.md }, style]}>
+    <View ref={ref} collapsable={false} style={[{ marginBottom: spacing.md }, error ? styles.fieldInvalid : null, style]}>
       {label ? (
-        <Text style={{ fontSize: font.sizes.sm, color: colors.muted2, marginBottom: 6, fontWeight: "600" }}>
+        <Text style={{ fontSize: font.sizes.sm, color: error ? colors.danger : colors.muted2, marginBottom: 6, fontWeight: "600" }}>
           {label}
           {required ? <Text style={{ color: colors.danger, fontWeight: "700" }}> *</Text> : null}
         </Text>
       ) : null}
+      {error ? <Text testID={errorTestID} accessibilityLiveRegion="polite" style={styles.fieldError}>{error}</Text> : null}
       {children}
     </View>
   );
-}
+});
 
-const styles = StyleSheet.create({
+const styles = bindBrandStyles({
   btn: {
     minHeight: 52, borderRadius: radii.md, alignItems: "center", justifyContent: "center", paddingHorizontal: 20,
     flexDirection: "row", gap: 9,
   },
+  btnCompact: { paddingHorizontal: 12, gap: 6 },
   dimensional: { shadowColor: colors.brandBrownDark, shadowOpacity: .2, shadowRadius: 9, shadowOffset: { width: 0, height: 4 }, elevation: 3 },
   dangerDepth: { shadowColor: "#7F1D1D" },
+  secondaryBtn: { borderWidth: 1, borderColor: colors.warmBorder },
   dimensionalPressed: { shadowOpacity: .03, elevation: 1 },
-  btnTxt: { fontSize: font.sizes.base, fontWeight: "700" },
+  btnTxt: { fontSize: font.sizes.base, fontWeight: "700", flexShrink: 1 },
   card: {
     backgroundColor: colors.white, borderRadius: radii.md, padding: spacing.lg,
     borderWidth: 1, borderColor: colors.warmBorder,
   },
   pill: { paddingHorizontal: 10, paddingVertical: 4, borderRadius: radii.pill, alignSelf: "flex-start" },
+  fieldInvalid: { borderWidth: 1, borderColor: colors.danger, borderRadius: radii.md, padding: 10, backgroundColor: "#FEF2F2" },
+  fieldError: { color: colors.danger, fontSize: 12, lineHeight: 16, fontWeight: "700", marginBottom: 8 },
 });

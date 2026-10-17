@@ -1,14 +1,16 @@
 import React, { useEffect, useState, useCallback } from "react";
-import { View, Text, StyleSheet, FlatList, RefreshControl, Modal, Pressable, TextInput, ScrollView, Alert, Image } from "react-native";
-import { CalendarDays, ChevronRight, LocateFixed, MapPin, MessageSquareText, Phone } from "lucide-react-native";
+import { bindBrandStyles } from "../../lib/brandStyles";
+import { View, Text, FlatList, RefreshControl, Modal, Pressable, TextInput, ScrollView, Alert, Image } from "react-native";
+import { CalendarDays, CheckCircle2, ChevronRight, Clock3, LocateFixed, MapPin, MessageSquareText, Phone, Sparkles, ArrowRight, Plus, X } from "lucide-react-native";
 import { colors, radii, spacing, font } from "../../lib/theme";
 import { Button, Field } from "../../components/UI";
 import { EmptyState, StatusBadge } from "../../components/ProductUI";
 import api from "../../lib/api";
-import { downloadInvoice, listBookings, listPaymentReports } from "../../lib/payments";
+import { downloadInvoice, listBookings, listCustomerRequests, listPaymentReports, payForBooking, showAppAlert, verifyCashfreeOrder } from "../../lib/payments";
 import { useI18n } from "../../lib/i18n";
 import { useAuth } from "../../lib/auth";
 import { startInAppCall } from "../../lib/calls";
+import { fetchMarketplaceSettings } from "../../lib/marketplace";
 
 const TIME_SLOTS = ["06:00", "07:30", "09:00", "10:30", "16:00", "17:30", "19:00"];
 const DISPUTE_CATEGORIES = [
@@ -18,7 +20,25 @@ const DISPUTE_CATEGORIES = [
   { id: "payment_issue", en: "Payment issue", kn: "ಪಾವತಿ ಸಮಸ್ಯೆ" },
   { id: "other", en: "Other", kn: "ಇನ್ನಿತರ" },
 ];
-const DEMO_CUSTOMER_BOOKING = { id: "demo-confirmed", demo: true, status: "confirmed", payment_status: "paid", pooja_name: "Satyanarayan Pooja", priest_name: "Demo Purohit", priest_phone: "9876543210", booking_date: "2026-08-10", booking_time: "07:30", address: "Jayanagar, Bengaluru", total_amount: 3100, customer_name: "Demo Customer", customer_phone: "9000000001" };
+
+const futureDate = (days) => {
+  const d = new Date();
+  d.setDate(d.getDate() + days);
+  return d.toISOString().slice(0, 10);
+};
+
+const getDemoCustomerBooking = () => ({ id: "demo-confirmed", demo: true, status: "confirmed", payment_status: "paid", pooja_name: "Satyanarayan Pooja", priest_name: "Demo Purohit", priest_phone: "9876543210", booking_date: futureDate(2), booking_time: "07:30", address: "Jayanagar, Bengaluru", total_amount: 3100, customer_name: "Demo Customer", customer_phone: "9000000001" });
+const getDemoCustomerRequests = () => [
+  { id: "demo-req-1", pooja_name: "Griha Pravesh Puja", ceremony_date: futureDate(3), ceremony_time: "09:00", address: "Indiranagar, Bengaluru", proposal_count: 2, status: "open", budget_min_inr: 3500, budget_max_inr: 6500 },
+];
+
+function bookingStatusLabel(booking) {
+  if (booking.payment_status === "refunded") return "refunded";
+  if (booking.payment_status === "refund_pending") return "refund in progress";
+  if (booking.status === "pending") return booking.payment_status === "paid" ? "awaiting purohit" : "waiting for purohit";
+  if (booking.status === "accepted") return "accepted · pay now";
+  return booking.status;
+}
 
 function upcomingDates(days = 14) {
   const out = [];
@@ -29,7 +49,10 @@ function upcomingDates(days = 14) {
 export default function MyBookings({ navigation }) {
   const { t, language } = useI18n();
   const { user } = useAuth();
+  const [activeTab, setActiveTab] = useState("bookings"); // "bookings" | "proposals"
+  const [biddingEnabled, setBiddingEnabled] = useState(false);
   const [items, setItems] = useState([]);
+  const [requests, setRequests] = useState([]);
   const [refreshing, setRefreshing] = useState(false);
   const [cancelTarget, setCancelTarget] = useState(null);
   const [cancelPolicy, setCancelPolicy] = useState(null);
@@ -44,16 +67,40 @@ export default function MyBookings({ navigation }) {
   const [reviewTarget, setReviewTarget] = useState(null);
   const [rating, setRating] = useState(5);
   const [comment, setComment] = useState("");
+  const [payingId, setPayingId] = useState(null);
 
   const load = useCallback(async () => {
-    if (user?.demo) return setItems([DEMO_CUSTOMER_BOOKING]);
+    if (user?.demo) {
+      setItems([getDemoCustomerBooking()]);
+      setRequests(getDemoCustomerRequests());
+      return;
+    }
     try {
-      const [{ bookings }, { reports }] = await Promise.all([listBookings(), listPaymentReports()]);
+      const [{ bookings }, { reports }, reqData] = await Promise.all([
+        listBookings().catch(() => ({ bookings: [] })),
+        listPaymentReports().catch(() => ({ reports: [] })),
+        listCustomerRequests().catch(() => ({ requests: [] })),
+      ]);
       const reportsByBooking = Object.fromEntries((reports || []).map((report) => [report.booking_id, report]));
       setItems((bookings || []).map((booking) => ({ ...booking, payment_report: reportsByBooking[booking.id] })));
-    } catch (_) { setItems([]); }
+      setRequests(reqData?.requests || []);
+    } catch (_) {
+      setItems([]);
+      setRequests([]);
+    }
   }, [user?.demo]);
+
   useEffect(() => { load(); }, [load]);
+  useEffect(() => { fetchMarketplaceSettings().then((settings) => setBiddingEnabled(settings.bidding_enabled === true)).catch(() => setBiddingEnabled(false)); }, []);
+  useEffect(() => {
+    if (!user?.id || typeof window === "undefined") return;
+    const orderId = new URLSearchParams(window.location.search).get("order_id");
+    if (!orderId || !/^PC_[a-f0-9]{28}$/i.test(orderId)) return;
+    verifyCashfreeOrder({ order_id: orderId })
+      .then(({ order }) => showAppAlert(order?.status === "paid" ? "Payment confirmed" : "Payment status", order?.status === "paid" ? "Your booking is confirmed and the invoice is ready." : "Payment is still being confirmed. Pull down to refresh shortly."))
+      .catch((error) => showAppAlert("Payment verification", error?.message || "Could not verify payment yet."))
+      .finally(() => { window.history.replaceState({}, "", window.location.pathname); load(); });
+  }, [user?.id, load]);
   const onRefresh = async () => { setRefreshing(true); await load(); setRefreshing(false); };
 
   const openCancel = async (b) => {
@@ -93,9 +140,37 @@ export default function MyBookings({ navigation }) {
   };
   const openInvoice = async (b) => {
     const report = b.payment_report;
-    if (!report?.invoice_html) return Alert.alert("Invoice pending", "The invoice will appear after Cashfree confirms the payment.");
+    if (!report?.invoice_html) return showAppAlert("Invoice pending", "The invoice will appear after Cashfree confirms the payment.");
     try { await downloadInvoice(report.invoice_html, report.invoice_number); }
-    catch (error) { Alert.alert("Invoice unavailable", error?.message || "Please try again."); }
+    catch (error) { showAppAlert("Invoice unavailable", error?.message || "Please try again."); }
+  };
+
+  const payNow = async (b) => {
+    setPayingId(b.id);
+    try {
+      const verified = await payForBooking(b.id);
+      if (verified.order?.status === "paid") Alert.alert("Booking confirmed", `Payment received. ${b.priest_name || "Your Purohit"} will see you on ${b.booking_date}.`);
+      else Alert.alert("Payment pending", "Cashfree has not confirmed this payment yet. Pull down to refresh in a moment, or tap Pay now again.");
+    } catch (error) {
+      Alert.alert("Payment failed", error?.message || "Please try again.");
+    } finally {
+      setPayingId(null);
+      load();
+    }
+  };
+
+  const openProposalComparison = (req) => {
+    navigation.navigate("RequestProposals", {
+      requestId: req.id,
+      poojaName: req.pooja_name,
+      ceremonyDate: req.ceremony_date,
+      ceremonyTime: req.ceremony_time,
+      address: req.address,
+      landmark: req.landmark,
+      lat: req.latitude,
+      lng: req.longitude,
+      request: req,
+    });
   };
 
   return (
@@ -106,28 +181,136 @@ export default function MyBookings({ navigation }) {
         ListHeaderComponent={
           <View style={styles.header}>
             <View style={styles.headerCopy}>
-              <Text style={styles.headerKicker}>TRIPS AND CEREMONIES</Text>
+              <Text style={styles.headerKicker}>YOUR CEREMONIES</Text>
               <Text style={styles.h1}>{t.tabBookings}</Text>
-              <Text style={styles.sub}>Upcoming ceremonies, arrivals, invoices, and past bookings.</Text>
+              <Text style={styles.sub}>Track requests, payments, and ceremony progress in one place.</Text>
             </View>
+
+            {/* Segmented Switcher */}
+            <View style={styles.segmentWrap}>
+              <Pressable
+                onPress={() => setActiveTab("bookings")}
+                style={[styles.segmentBtn, activeTab === "bookings" && styles.segmentBtnActive]}
+              >
+                <CalendarDays size={15} color={activeTab === "bookings" ? colors.white : colors.ink} />
+                <Text style={[styles.segmentText, activeTab === "bookings" && styles.segmentTextActive]}>
+                  Bookings ({items.length})
+                </Text>
+              </Pressable>
+
+              {(biddingEnabled || requests.length > 0) && <Pressable
+                onPress={() => setActiveTab("proposals")}
+                style={[styles.segmentBtn, activeTab === "proposals" && styles.segmentBtnActive]}
+              >
+                <Sparkles size={15} color={activeTab === "proposals" ? colors.white : colors.saffron} />
+                <Text style={[styles.segmentText, activeTab === "proposals" && styles.segmentTextActive]}>
+                  Proposals ({requests.length})
+                </Text>
+              </Pressable>}
+            </View>
+
+            {activeTab === "proposals" && biddingEnabled && (
+              <Pressable
+                onPress={() => navigation.navigate("RequestPooja")}
+                style={styles.newRequestBtn}
+              >
+                <Plus size={16} color={colors.saffron} />
+                <Text style={styles.newRequestText}>Request proposals for a new ceremony</Text>
+              </Pressable>
+            )}
           </View>
         }
-        data={items}
+        data={activeTab === "bookings" ? items : requests}
         keyExtractor={(b) => b.id}
         ItemSeparatorComponent={() => <View style={{ height: spacing.md }} />}
-        ListEmptyComponent={<EmptyState icon={CalendarDays} title="No bookings yet" body="Your confirmed ceremonies and proposal selections will appear here." />}
-        renderItem={({ item: b }) => {
+        ListEmptyComponent={
+          activeTab === "bookings" ? (
+            <EmptyState
+              icon={CalendarDays}
+              title="No direct bookings yet"
+              body="Your scheduled ceremonies with confirmed purohits will appear here."
+            />
+          ) : (
+            <View style={styles.emptyProposals}>
+              <Sparkles size={32} color={colors.saffron} />
+              <Text style={styles.emptyProposalsTitle}>No ceremony requests yet</Text>
+              <Text style={styles.emptyProposalsBody}>
+                Invite verified purohits to quote on your pooja. You can compare their prices, samagri inclusions, and reviews.
+              </Text>
+              <Pressable
+                onPress={() => navigation.navigate("RequestPooja")}
+                style={styles.emptyActionBtn}
+              >
+                <Text style={styles.emptyActionText}>Start a Ceremony Request</Text>
+                <ArrowRight size={16} color={colors.white} />
+              </Pressable>
+            </View>
+          )
+        }
+        renderItem={({ item }) => {
+          if (activeTab === "proposals") {
+            const req = item;
+            const hasProposals = (req.proposal_count || 0) > 0;
+            return (
+              <Pressable
+                onPress={() => openProposalComparison(req)}
+                style={styles.proposalCard}
+              >
+                <View style={styles.proposalTop}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.title}>{req.pooja_name}</Text>
+                    <Text style={styles.meta}>
+                      {req.ceremony_date} {req.ceremony_time ? `· ${req.ceremony_time}` : ""}
+                    </Text>
+                  </View>
+                  <StatusBadge
+                    label={req.status === "open" ? (hasProposals ? `${req.proposal_count} PROPOSALS` : "OPEN") : req.status.toUpperCase()}
+                    tone={hasProposals ? "accent" : req.status === "awarded" ? "success" : "neutral"}
+                  />
+                </View>
+
+                <View style={styles.detailRow}>
+                  <MapPin size={15} color={colors.ink} />
+                  <Text style={styles.detailText} numberOfLines={1}>{req.address}</Text>
+                </View>
+
+                {req.budget_min_inr || req.budget_max_inr ? (
+                  <Text style={styles.budgetMeta}>
+                    Budget guidance: ₹{(req.budget_min_inr || 0).toLocaleString("en-IN")} - ₹{(req.budget_max_inr || 0).toLocaleString("en-IN")}
+                  </Text>
+                ) : null}
+
+                <View style={styles.proposalActionRow}>
+                  <View style={styles.proposalPill}>
+                    <Sparkles size={14} color={hasProposals ? colors.saffron : colors.muted2} />
+                    <Text style={[styles.proposalCountText, hasProposals && { color: colors.brandBrownDark, fontWeight: "700" }]}>
+                      {hasProposals
+                        ? `${req.proposal_count} purohit proposal${req.proposal_count > 1 ? "s" : ""} received`
+                        : "Waiting for purohit responses"}
+                    </Text>
+                  </View>
+                  <View style={styles.compareBtn}>
+                    <Text style={styles.compareBtnText}>Compare</Text>
+                    <ChevronRight size={15} color={colors.white} />
+                  </View>
+                </View>
+              </Pressable>
+            );
+          }
+
+          const b = item;
           const total = b.total_amount || b.price;
           const canReschedule = ["pending", "confirmed"].includes(b.status);
           const canCancel = ["pending", "confirmed"].includes(b.status);
-          const pillStatus = b.payment_status === "refunded" ? "refunded" : b.status;
+          const awaitingPayment = b.status === "accepted" && b.payment_status !== "paid";
+          const pillStatus = bookingStatusLabel(b);
           return (
             <View testID={`booking-${b.id}`} style={styles.bookingCard}>
               <Image source={require("../../../assets/images/ritual-home-hero.png")} style={styles.bookingImage} />
               <View style={styles.bookingBody}>
               <View style={styles.bookingTop}>
                 <View style={{ flex: 1 }}><Text style={styles.title}>{b.pooja_name}</Text><Text style={styles.meta}>with {b.priest_name}</Text></View>
-                <StatusBadge label={pillStatus} tone={pillStatus === "confirmed" ? "neutral" : pillStatus === "completed" ? "success" : pillStatus === "cancelled" ? "danger" : "accent"} />
+                <StatusBadge label={pillStatus} tone={pillStatus === "confirmed" ? "neutral" : pillStatus === "completed" ? "success" : ["cancelled", "rejected"].includes(pillStatus) ? "danger" : "accent"} />
               </View>
               <View style={styles.detailRow}><CalendarDays size={15} color={colors.ink} /><Text style={styles.detailText}>{b.booking_date} · {b.booking_time}</Text></View>
               <View style={styles.detailRow}><MapPin size={15} color={colors.ink} /><Text style={styles.detailText} numberOfLines={1}>{b.address}</Text></View>
@@ -141,17 +324,41 @@ export default function MyBookings({ navigation }) {
                   <Text style={{ color: colors.info, fontSize: font.sizes.xs }}>Refunded ₹{(b.refund_amount || 0).toLocaleString("en-IN")}</Text>
                 )}
               </View>
-              {b.status === "confirmed" ? <View style={styles.primaryActions}>
-                <Pressable testID={`track-btn-${b.id}`} onPress={() => navigation.navigate("TrackPriest", { booking: b })} style={styles.trackAction}><LocateFixed size={17} color={colors.white} /><Text style={styles.trackActionText}>Track purohit</Text><ChevronRight size={16} color={colors.white} /></Pressable>
-                <Pressable testID={`message-btn-${b.id}`} accessibilityLabel="Message purohit" onPress={() => navigation.navigate("Conversation", { bookingId: b.id })} style={styles.roundAction}><MessageSquareText size={17} color={colors.ink} /></Pressable>
-                <Pressable
+              {b.status === "pending" && b.payment_status !== "paid" ? (
+                <View style={styles.statusStripSelected}>
+                  <Clock3 size={15} color={colors.brandBrown} />
+                  <Text style={styles.statusStripSelectedText}>Selected — waiting for acceptance</Text>
+                </View>
+              ) : null}
+              {b.status === "rejected" ? (
+                <View style={styles.statusStripRejected}>
+                  <X size={15} color={colors.danger} />
+                  <Text style={styles.statusStripRejectedText}>Rejected — {b.priest_name || "the purohit"} declined</Text>
+                </View>
+              ) : null}
+              {b.status === "cancelled" ? (
+                <View style={styles.statusStripMuted}>
+                  <Text style={styles.statusStripMutedText}>Cancelled</Text>
+                </View>
+              ) : null}
+              {awaitingPayment ? (
+                <View style={styles.statusStripReady}>
+                  <CheckCircle2 size={15} color={colors.success} />
+                  <Text style={styles.statusStripReadyText}>Accepted — ready to pay</Text>
+                </View>
+              ) : null}
+              {awaitingPayment ? <Button testID={`pay-btn-${b.id}`} title={payingId === b.id ? "Opening secure checkout…" : `Pay ₹${Number(total || 0).toLocaleString("en-IN")} to confirm`} onPress={() => payNow(b)} disabled={!!payingId} style={{ marginTop: 14 }} /> : null}
+              {b.status === "confirmed" || b.payment_status === "paid" ? <View style={styles.primaryActions}>
+                {b.status === "confirmed" ? <Pressable testID={`track-btn-${b.id}`} onPress={() => navigation.navigate("TrackPriest", { booking: b })} style={styles.trackAction}><LocateFixed size={17} color={colors.white} /><Text style={styles.trackActionText}>Track purohit</Text><ChevronRight size={16} color={colors.white} /></Pressable> : null}
+                <Pressable testID={`message-btn-${b.id}`} accessibilityLabel="Message purohit" onPress={() => navigation.navigate("Conversation", { bookingId: b.id, priestName: b.priest_name, customerName: b.customer_name, poojaName: b.pooja_name })} style={styles.roundAction}><MessageSquareText size={17} color={colors.ink} /></Pressable>
+                {b.status === "confirmed" ? <Pressable
                   testID={`call-btn-${b.id}`}
                   accessibilityLabel="In-app call purohit"
                   onPress={() => startInAppCall(navigation, { bookingId: b.id, booking: b })}
                   style={styles.roundAction}
                 >
                   <Phone size={17} color={colors.ink} />
-                </Pressable>
+                </Pressable> : null}
               </View> : null}
               <View style={styles.actions}>
                 {b.status === "completed" && <ActionBtn label={t.reviewCta} testID={`review-btn-${b.id}`} onPress={() => setReviewTarget(b)} />}
@@ -292,7 +499,7 @@ function Sheet({ visible, onClose, title, children }) {
   );
 }
 
-const styles = StyleSheet.create({
+const styles = bindBrandStyles({
   header: { marginBottom: spacing.xl, paddingTop: 12 },
   headerCopy: { marginBottom: 4 },
   headerKicker: { color: colors.saffron, fontSize: 10, fontWeight: "700", letterSpacing: .8 },
@@ -308,6 +515,15 @@ const styles = StyleSheet.create({
   detailText: { flex: 1, fontSize: 12, color: colors.muted2 },
   metaSmall: { fontSize: 11, color: colors.muted2, marginTop: 4 },
   priceRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginTop: 15 },
+  flowHint: { color: colors.muted2, fontSize: 12, lineHeight: 17, marginTop: 10 },
+  statusStripSelected: { marginTop: 12, minHeight: 44, borderRadius: 12, borderWidth: 1.5, borderColor: colors.brandBrown, backgroundColor: "#F8F1EE", flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8, paddingHorizontal: 12 },
+  statusStripSelectedText: { color: colors.brandBrown, fontSize: 13, fontWeight: "700" },
+  statusStripRejected: { marginTop: 12, minHeight: 44, borderRadius: 12, borderWidth: 1.5, borderColor: "#F3C1C1", backgroundColor: "#FEF2F2", flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8, paddingHorizontal: 12 },
+  statusStripRejectedText: { color: colors.danger, fontSize: 13, fontWeight: "700" },
+  statusStripReady: { marginTop: 12, minHeight: 44, borderRadius: 12, borderWidth: 1.5, borderColor: "#B7E0C2", backgroundColor: "#F1F8F4", flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8, paddingHorizontal: 12 },
+  statusStripReadyText: { color: colors.success, fontSize: 13, fontWeight: "700" },
+  statusStripMuted: { marginTop: 12, minHeight: 44, borderRadius: 12, backgroundColor: colors.muted, alignItems: "center", justifyContent: "center", paddingHorizontal: 12 },
+  statusStripMutedText: { color: colors.muted2, fontSize: 13, fontWeight: "700" },
   price: { color: colors.ink, fontWeight: "700", fontSize: 17 },
   primaryActions: { flexDirection: "row", alignItems: "center", gap: 8, marginTop: 16 },
   trackAction: { flex: 1, minHeight: 46, borderRadius: 23, backgroundColor: colors.brandBrown, paddingHorizontal: 15, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 7 },
@@ -325,7 +541,26 @@ const styles = StyleSheet.create({
   policySub: { fontSize: font.sizes.xs, color: colors.ink, marginTop: 4 },
   radio: { padding: 12, borderRadius: radii.md, borderWidth: 1, borderColor: colors.warmBorder, backgroundColor: colors.white },
   dayChip: { width: 54, height: 60, borderRadius: radii.md, backgroundColor: colors.white, borderWidth: 1, borderColor: colors.warmBorder, alignItems: "center", justifyContent: "center", marginRight: 8 },
-  timeChip: { paddingHorizontal: 14, paddingVertical: 10, borderRadius: radii.pill, backgroundColor: colors.white, borderWidth: 1, borderColor: colors.warmBorder },
   sheetOverlay: { flex: 1, backgroundColor: "rgba(0,0,0,0.4)", justifyContent: "flex-end" },
   sheet: { backgroundColor: colors.cotton, padding: spacing.lg, borderTopLeftRadius: 24, borderTopRightRadius: 24, maxHeight: "88%" },
+  segmentWrap: { flexDirection: "row", backgroundColor: colors.muted, borderRadius: radii.pill, padding: 4, marginTop: 16 },
+  segmentBtn: { flex: 1, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 7, paddingVertical: 10, borderRadius: radii.pill },
+  segmentBtnActive: { backgroundColor: colors.brandBrown, shadowColor: "#000", shadowOpacity: 0.1, shadowRadius: 3, elevation: 2 },
+  segmentText: { color: colors.muted2, fontSize: 13, fontWeight: "700" },
+  segmentTextActive: { color: colors.white, fontWeight: "800" },
+  newRequestBtn: { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6, marginTop: 14, paddingVertical: 11, borderRadius: radii.md, backgroundColor: "#FFF7ED", borderWidth: 1, borderColor: "#FED7AA" },
+  newRequestText: { color: colors.saffron, fontSize: 13, fontWeight: "700" },
+  proposalCard: { padding: 18, backgroundColor: colors.white, borderRadius: radii.xl, borderWidth: 1, borderColor: colors.warmBorder, marginBottom: 12 },
+  proposalTop: { flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start", gap: 10 },
+  budgetMeta: { color: colors.muted2, fontSize: 12, marginTop: 8 },
+  proposalActionRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 14, paddingTop: 12, borderTopWidth: 1, borderColor: colors.warmBorder },
+  proposalPill: { flex: 1, flexDirection: "row", alignItems: "center", gap: 6 },
+  proposalCountText: { color: colors.muted2, fontSize: 12, fontWeight: "600" },
+  compareBtn: { flexDirection: "row", alignItems: "center", gap: 4, backgroundColor: colors.brandBrown, paddingHorizontal: 14, paddingVertical: 8, borderRadius: 16 },
+  compareBtnText: { color: colors.white, fontSize: 12, fontWeight: "700" },
+  emptyProposals: { alignItems: "center", padding: 32, backgroundColor: colors.white, borderRadius: radii.xl, borderWidth: 1, borderColor: colors.warmBorder, marginTop: 10 },
+  emptyProposalsTitle: { color: colors.ink, fontSize: 18, fontWeight: "700", marginTop: 12 },
+  emptyProposalsBody: { color: colors.muted2, fontSize: 13, textAlign: "center", lineHeight: 19, marginTop: 6, maxWidth: 280 },
+  emptyActionBtn: { flexDirection: "row", alignItems: "center", gap: 8, backgroundColor: colors.brandBrown, paddingHorizontal: 18, paddingVertical: 12, borderRadius: radii.pill, marginTop: 18 },
+  emptyActionText: { color: colors.white, fontSize: 13, fontWeight: "700" },
 });

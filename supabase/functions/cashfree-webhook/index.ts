@@ -1,4 +1,6 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { formatInr, notifyUsers, priestUserId } from "../_shared/notify.ts";
+import { renderBookingInvoice } from "../_shared/invoice.ts";
 
 const encoder = new TextEncoder();
 
@@ -116,8 +118,15 @@ async function markPaid(supabase: any, order: any, now: string) {
   if (!booking) throw new Error("Booking for paid order was not found");
 
   const invoiceNumber = booking.invoice_no || makeInvoiceNumber();
-  const invoiceHtml = booking.invoice_html || renderInvoice(invoiceNumber, booking, order);
+  const invoiceHtml = renderBookingInvoice({
+    invoiceNumber,
+    booking,
+    amountInr: Number(order.amount_paise) / 100,
+    issuedAt: booking.invoice_issued_at || now,
+    payment: { mode: "Online (Cashfree)", status: "paid", reference: order.merchant_order_id, paidAt: order.paid_at || now },
+  });
   await supabase.from("bookings").update({
+    ...(booking.status === "accepted" ? { status: "confirmed" } : {}),
     payment_status: "paid",
     payment_id: order.id,
     payment_provider: "cashfree",
@@ -135,7 +144,7 @@ async function markPaid(supabase: any, order: any, now: string) {
   const feePercent = Number(order.metadata?.fee_breakdown?.service_fee_percent) || (await getPlatformServiceFeePercent(supabase));
   const platformFee = typeof order.metadata?.fee_breakdown?.platform_fee_paise === "number"
     ? order.metadata.fee_breakdown.platform_fee_paise
-    : Math.round(Number(order.amount_paise) * (feePercent / 100));
+    : Math.round(Number(order.amount_paise) * feePercent / (100 + feePercent));
   await supabase.from("provider_earnings").upsert({
     booking_id: booking.id,
     payment_order_id: order.id,
@@ -181,6 +190,29 @@ async function markPaid(supabase: any, order: any, now: string) {
       title: "Payment confirmed and invoice ready",
       body: `${booking.pooja_name || order.pooja_slug || "Ceremony"} · ${invoiceNumber} · ₹${(Number(order.amount_paise) / 100).toLocaleString("en-IN")}`,
     }).then(() => undefined, () => undefined);
+    const amount = formatInr(Number(order.amount_paise) / 100);
+    const when = `${booking.booking_date} ${String(booking.booking_time || "").slice(0, 5)}`.trim();
+    const awaitingPriest = booking.status === "pending";
+    await Promise.all([
+      notifyUsers(supabase, {
+        userIds: [await priestUserId(supabase, order.priest_id)],
+        type: awaitingPriest ? "booking_request" : "payment_confirmed",
+        title: awaitingPriest ? `New paid booking: ${booking.pooja_name || "Ceremony"}` : `Booking confirmed: ${booking.pooja_name || "Ceremony"}`,
+        body: awaitingPriest
+          ? `${booking.customer_name || "A customer"} paid ${amount} for ${when}. Accept or decline it.`
+          : `${booking.customer_name || "The customer"} paid ${amount}. ${when}`,
+        bookingId: booking.id,
+      }),
+      notifyUsers(supabase, {
+        userIds: [order.customer_id],
+        type: "payment_confirmed",
+        title: awaitingPriest ? "Payment received" : "Payment received, booking confirmed",
+        body: awaitingPriest
+          ? `Waiting for ${booking.priest_name || "the Purohit"} to accept. You get a full refund if they decline.`
+          : `${booking.pooja_name || "Ceremony"} with ${booking.priest_name || "your Purohit"} · ${when}`,
+        bookingId: booking.id,
+      }),
+    ]);
   }
 }
 
@@ -271,11 +303,6 @@ function constantTimeEqual(left: string, right: string) {
   return mismatch === 0;
 }
 
-function renderInvoice(invoiceNumber: string, booking: any, order: any) {
-  const amount = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR" }).format(Number(order.amount_paise) / 100);
-  return `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(invoiceNumber)}</title><style>body{font-family:Arial,sans-serif;color:#2b1b14;margin:40px}.head{display:flex;justify-content:space-between;border-bottom:2px solid #ea580c;padding-bottom:20px}.total{font-size:28px;font-weight:700}.muted{color:#6b625e}</style></head><body><div class="head"><div><h1>Purohith Connect</h1><p class="muted">Book · Perform · Bless</p></div><div><strong>${escapeHtml(invoiceNumber)}</strong><p class="muted">Paid via Cashfree</p></div></div><h2>${escapeHtml(booking.pooja_name || order.pooja_slug || "Ceremony booking")}</h2><p>${escapeHtml(booking.booking_date || "")} ${escapeHtml(booking.booking_time || "")}</p><p>${escapeHtml(booking.address || "")}</p><p class="total">${escapeHtml(amount)}</p><p>Cashfree order: ${escapeHtml(order.merchant_order_id)}</p><p class="muted">Payment confirmed by a signed provider webhook.</p></body></html>`;
-}
-
 function makeInvoiceNumber() {
   return `PC-${new Date().toISOString().slice(0, 10).replaceAll("-", "")}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
 }
@@ -301,10 +328,6 @@ function getSupabaseSecretKey() {
 
 function clean(value: unknown) {
   return String(value || "").trim();
-}
-
-function escapeHtml(value: unknown) {
-  return clean(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
 }
 
 function json(payload: unknown, status = 200) {
