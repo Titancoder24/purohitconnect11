@@ -3,20 +3,21 @@ import { Platform } from "react-native";
 import Constants from "expo-constants";
 import * as Device from "expo-device";
 import * as Notifications from "expo-notifications";
-import api from "./api";
+import { supabase } from "./supabase";
 
-Notifications.setNotificationHandler({
-  handleNotification: async () => ({
-    shouldShowAlert: true,
-    shouldPlaySound: true,
-    shouldSetBadge: false,
-  }),
-});
+if (Platform.OS !== "web") {
+  Notifications.setNotificationHandler({
+    handleNotification: async () => ({
+      shouldShowAlert: true,
+      shouldPlaySound: true,
+      shouldSetBadge: false,
+    }),
+  });
+}
 
-/** Register the device for push and POST the token to the backend. */
-export async function registerForPush() {
-  if (Platform.OS === "web") return null;
-  if (!Device.isDevice) return null;   // simulators can't get real tokens
+let registeredToken = null;
+
+async function configureChannels() {
   if (Platform.OS === "android") {
     await Notifications.setNotificationChannelAsync("default", {
       name: "Booking updates",
@@ -24,14 +25,30 @@ export async function registerForPush() {
       vibrationPattern: [0, 250, 250, 250],
       lightColor: "#EA580C",
     });
+    await Notifications.setNotificationChannelAsync("marketing", {
+      name: "Offers and announcements",
+      description: "Festival reminders, new services, and Purohith Connect updates",
+      importance: Notifications.AndroidImportance.HIGH,
+      vibrationPattern: [0, 250, 250, 250],
+      lightColor: "#EA580C",
+    });
   }
+}
+
+/**
+ * Register this device for push. Resolves to { status, token? } where status is
+ * "registered", "denied", or "unsupported".
+ */
+export async function registerForPush() {
+  if (Platform.OS === "web" || !Device.isDevice) return { status: "unsupported" };
+  await configureChannels();
   const perms = await Notifications.getPermissionsAsync();
   let status = perms.status;
-  if (status !== "granted") {
+  if (status !== "granted" && perms.canAskAgain !== false) {
     const req = await Notifications.requestPermissionsAsync();
     status = req.status;
   }
-  if (status !== "granted") return null;
+  if (status !== "granted") return { status: "denied" };
   const projectId =
     Constants.expoConfig?.extra?.eas?.projectId ||
     Constants.easConfig?.projectId;
@@ -39,13 +56,19 @@ export async function registerForPush() {
     projectId ? { projectId } : undefined
   );
   const token = tokenResp?.data;
-  if (token) {
-    try {
-      await api.post("/users/push-token", { token, platform: Platform.OS });
-    } catch (e) {
-      // eslint-disable-next-line no-console
-      console.warn("push register failed", e?.response?.data || e?.message);
-    }
+  if (token && supabase) {
+    const { error } = await supabase.functions.invoke("call-notify", {
+      body: { action: "register_token", token, platform: Platform.OS },
+    });
+    if (error) throw error;
+    registeredToken = token;
   }
-  return token;
+  return { status: "registered", token };
+}
+
+export async function unregisterPush() {
+  if (!registeredToken || !supabase) return;
+  const token = registeredToken;
+  registeredToken = null;
+  await supabase.functions.invoke("call-notify", { body: { action: "unregister_token", token } }).catch(() => {});
 }

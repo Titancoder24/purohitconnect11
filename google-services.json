@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "1049600550698",
+    "project_id": "purohith-connect",
+    "storage_bucket": "purohith-connect.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1049600550698:android:6e3923034bc27b07dda053",
+        "android_client_info": {
+          "package_name": "com.purohithconnect.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBv1QpdRa4N6n3Q6yjibzcBgzbnGhBDfYw"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

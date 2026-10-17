@@ -1,4 +1,6 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { formatInr, notifyUsers, priestUserId } from "../_shared/notify.ts";
+import { renderBookingInvoice } from "../_shared/invoice.ts";
 
 const UPI_ID = "sgmsfreshmindsservicesllp.8050934625.ibz@icici";
 const corsHeaders = {
@@ -24,7 +26,9 @@ Deno.serve(async (req) => {
     if (body.action === "list_proposals") return listProposals(supabase, body, identity);
     if (body.action === "award_proposal") return awardProposal(supabase, body, identity);
     if (body.action === "provider_requests") return providerRequests(supabase, body, identity);
+    if (body.action === "customer_requests") return customerRequests(supabase, identity);
     if (body.action === "send_proposal") return sendProposal(supabase, body, identity);
+    if (body.action === "create_booking_request") return createBookingRequest(supabase, body, identity);
     if (body.action === "create_cashfree_order") return createCashfreeOrder(supabase, body, identity);
     if (body.action === "verify_cashfree_order") return verifyCashfreeOrder(supabase, body, identity);
     if (body.action === "list_payment_reports") return listPaymentReports(supabase, identity);
@@ -44,6 +48,7 @@ Deno.serve(async (req) => {
 });
 
 async function createRequest(supabase: any, body: any, identity: any) {
+  if (!(await biddingEnabled(supabase))) return json({ error: "Proposal requests are currently disabled. Choose a priest profile and book at its published price." }, 409);
   const customerId = identity.id;
   if (!clean(body.address) || !clean(body.pooja_slug)) return json({ error: "Ceremony and address are required" }, 400);
 
@@ -58,13 +63,27 @@ async function createRequest(supabase: any, body: any, identity: any) {
     notes: clean(body.notes),
     budget_min_inr: numberOrNull(body.budget_min_inr ?? body.budget_min),
     budget_max_inr: numberOrNull(body.budget_max_inr ?? body.budget_max),
-    latitude: numberOrNull(body.lat ?? body.latitude),
-    longitude: numberOrNull(body.lng ?? body.longitude),
+    latitude: coordinate(body.lat ?? body.latitude),
+    longitude: coordinate(body.lng ?? body.longitude),
     status: "open",
     payment_status: "unpaid",
   };
   const { data, error } = await supabase.from("ceremony_requests").insert(payload).select("*").single();
   if (error) throw error;
+  const { data: matchingPriests } = await supabase.from("priest_profiles")
+    .select("user_id")
+    .contains("pooja_slugs", [payload.pooja_slug])
+    .not("user_id", "is", null)
+    .neq("user_id", customerId)
+    .limit(500);
+  const budget = payload.budget_max_inr ? ` · Budget up to ${formatInr(payload.budget_max_inr)}` : "";
+  await notifyUsers(supabase, {
+    userIds: (matchingPriests || []).map((priest: any) => priest.user_id),
+    type: "open_request",
+    title: `New ${pooja?.name || "pooja"} request`,
+    body: `${[payload.ceremony_date, payload.ceremony_time].filter(Boolean).join(" ")} · ${payload.address}${budget}. Send your quote.`,
+    requestId: data.id,
+  });
   return json({
     request: mapRequest(data, pooja),
     upi_id: UPI_ID,
@@ -86,16 +105,11 @@ async function submitPayment(supabase: any, body: any, identity: any) {
   const ai = await verifyScreenshotWithOpenAI(supabase, body.screenshot_data_url, amount);
   const status = ai.verified && ai.confidence >= 0.7 ? "ai_verified" : "submitted";
   const invoiceNumber = makeInvoiceNumber();
-  const invoiceHtml = renderInvoice({
+  const invoiceHtml = renderBookingInvoice({
     invoiceNumber,
-    amount,
-    customerName: context.customer_name || "Customer",
-    poojaName: context.pooja_name || clean(body.pooja_name) || "Purohith Connect Ceremony",
-    ceremonyDate: context.ceremony_date || context.booking_date || "",
-    ceremonyTime: context.ceremony_time || context.booking_time || "",
-    address: context.address || "",
-    upiId: UPI_ID,
-    status,
+    booking: { ...context, pooja_name: context.pooja_name || clean(body.pooja_name) || "Purohith Connect Ceremony" },
+    amountInr: amount,
+    payment: { mode: "UPI", status: "under_review", reference: UPI_ID },
   });
 
   const { data: payment, error } = await supabase.from("payment_submissions").insert({
@@ -144,14 +158,32 @@ async function submitPayment(supabase: any, body: any, identity: any) {
 async function listProposals(supabase: any, body: any, identity: any) {
   const requestId = cleanUuid(body.request_id);
   if (!requestId) return json({ proposals: [] });
-  const { data: request } = await supabase.from("ceremony_requests").select("customer_id").eq("id", requestId).maybeSingle();
+  const { data: request } = await supabase.from("ceremony_requests").select("id,customer_id,status,payment_status,awarded_proposal_id,booking_id,invoice_number").eq("id", requestId).maybeSingle();
   if (!request || (request.customer_id !== identity.id && !isAdmin(identity))) return json({ error: "Request not found" }, 404);
   const { data, error } = await supabase.from("ceremony_proposals")
     .select("id,request_id,priest_id,amount_inr,message,includes_samagri,status,created_at,priest_profiles(display_name,rating,review_count,photo_url)")
     .eq("request_id", requestId)
     .order("amount_inr", { ascending: true });
   if (error) throw error;
-  return json({ proposals: (data || []).map(mapProposal) });
+
+  let booking = null;
+  if (request.booking_id) {
+    const { data: b } = await supabase.from("bookings").select("id,status,payment_status,total_inr,invoice_no,invoice_html,invoice_issued_at").eq("id", request.booking_id).maybeSingle();
+    booking = b;
+  }
+
+  return json({
+    proposals: (data || []).map(mapProposal),
+    request: {
+      id: request.id,
+      status: request.status,
+      payment_status: request.payment_status,
+      awarded_proposal_id: request.awarded_proposal_id,
+      booking_id: request.booking_id,
+      invoice_number: request.invoice_number,
+    },
+    booking,
+  });
 }
 
 async function awardProposal(supabase: any, body: any, identity: any) {
@@ -161,22 +193,103 @@ async function awardProposal(supabase: any, body: any, identity: any) {
   const { data: proposal, error } = await supabase.from("ceremony_proposals").select("*").eq("id", proposalId).eq("request_id", requestId).maybeSingle();
   if (error) throw error;
   if (!proposal) return json({ error: "Proposal not found" }, 404);
-  const { data: request } = await supabase.from("ceremony_requests").select("id,customer_id,pooja_slug,ceremony_date,ceremony_time,address,landmark,latitude,longitude").eq("id", requestId).maybeSingle();
+  if (["rejected", "withdrawn", "declined"].includes(proposal.status)) return json({ error: "This proposal is no longer available" }, 409);
+  const { data: request } = await supabase.from("ceremony_requests").select("*").eq("id", requestId).maybeSingle();
   if (!request || (request.customer_id !== identity.id && !isAdmin(identity))) return json({ error: "Request not found" }, 404);
-  const { data: pooja } = request?.pooja_slug ? await supabase.from("poojas").select("name").eq("slug", request.pooja_slug).maybeSingle() : { data: null };
+  if (request.payment_status === "paid") return json({ error: "This ceremony is already paid" }, 409);
+
+  const now = new Date().toISOString();
   const { data: priest } = proposal.priest_id ? await supabase.from("priest_profiles").select("display_name,rating,review_count,photo_url").eq("id", proposal.priest_id).maybeSingle() : { data: null };
-  await supabase.from("ceremony_proposals").update({ status: "declined" }).eq("request_id", requestId).neq("id", proposalId);
-  await supabase.from("ceremony_proposals").update({ status: "accepted" }).eq("id", proposalId);
-  await supabase.from("ceremony_requests").update({ awarded_proposal_id: proposalId, status: "awarded", payment_status: "unpaid", updated_at: new Date().toISOString() }).eq("id", requestId);
+  const { data: pooja } = request.pooja_slug ? await supabase.from("poojas").select("name").eq("slug", request.pooja_slug).maybeSingle() : { data: null };
+
+  if (request.booking_id) {
+    const { data: existing } = await supabase.from("bookings").select("*").eq("id", request.booking_id).maybeSingle();
+    if (existing && request.awarded_proposal_id === proposalId && ["pending", "accepted", "confirmed"].includes(existing.status)) {
+      return json({
+        proposal_id: proposalId,
+        priest_id: proposal.priest_id,
+        status: existing.status === "pending" ? "awaiting_priest" : "accepted",
+        upi_id: UPI_ID,
+        amount_inr: proposal.amount_inr,
+        booking: existing,
+        proposal: mapProposal({ ...proposal, priest_profiles: priest }),
+        request: mapRequest(request, pooja),
+      });
+    }
+    if (existing?.payment_status === "paid" || existing?.status === "confirmed") return json({ error: "This ceremony is already booked" }, 409);
+    if (existing?.status === "accepted") return json({ error: "The purohit already accepted. Complete payment, or ask them to decline before choosing someone else." }, 409);
+    if (existing?.status === "pending") {
+      await supabase.from("bookings").update({ status: "cancelled", updated_at: now }).eq("id", existing.id);
+      if (request.awarded_proposal_id && request.awarded_proposal_id !== proposalId) {
+        await supabase.from("ceremony_proposals").update({ status: "active" }).eq("id", request.awarded_proposal_id).eq("status", "submitted");
+      }
+    }
+  }
+
+  const booking = await insertPendingBooking(supabase, {
+    customerId: identity.id,
+    priestId: proposal.priest_id,
+    poojaSlug: request.pooja_slug,
+    amountPaise: Number(proposal.amount_inr) * 100,
+    bookingDate: request.ceremony_date,
+    bookingTime: request.ceremony_time,
+    address: request.address,
+    landmark: request.landmark,
+    latitude: request.latitude,
+    longitude: request.longitude,
+    notes: request.notes,
+    status: "pending",
+    paymentStatus: "unpaid",
+  });
+  await supabase.from("ceremony_proposals").update({ status: "submitted" }).eq("id", proposalId);
+  await supabase.from("ceremony_requests").update({
+    awarded_proposal_id: proposalId,
+    booking_id: booking.id,
+    status: "awarded",
+    payment_status: "unpaid",
+    updated_at: now,
+  }).eq("id", requestId);
+  await notifyUsers(supabase, {
+    userIds: [await priestUserId(supabase, proposal.priest_id)],
+    type: "proposal_selected",
+    title: "A customer chose your quote",
+    body: `${pooja?.name || "Ceremony"} · ${formatInr(proposal.amount_inr)}. Accept to let them pay, or decline.`,
+    requestId,
+    bookingId: booking.id,
+  });
   return json({
     proposal_id: proposalId,
     priest_id: proposal.priest_id,
-    status: "awarded",
+    status: "awaiting_priest",
     upi_id: UPI_ID,
     amount_inr: proposal.amount_inr,
-    proposal: mapProposal({ ...proposal, status: "accepted", priest_profiles: priest }),
-    request: mapRequest(request, pooja),
+    booking,
+    proposal: mapProposal({ ...proposal, status: "submitted", priest_profiles: priest }),
+    request: mapRequest({ ...request, awarded_proposal_id: proposalId, booking_id: booking.id, payment_status: "unpaid" }, pooja),
   });
+}
+
+async function confirmAwardedProposal(supabase: any, bookingId: string) {
+  const { data: request } = await supabase.from("ceremony_requests").select("id,awarded_proposal_id").eq("booking_id", bookingId).maybeSingle();
+  if (!request?.awarded_proposal_id) return;
+  await supabase.from("ceremony_proposals").update({ status: "declined" }).eq("request_id", request.id).neq("id", request.awarded_proposal_id).in("status", ["active", "submitted"]);
+  await supabase.from("ceremony_proposals").update({ status: "accepted" }).eq("id", request.awarded_proposal_id);
+  await supabase.from("ceremony_requests").update({ status: "awarded", updated_at: new Date().toISOString() }).eq("id", request.id);
+}
+
+async function releaseRejectedProposal(supabase: any, bookingId: string, now: string) {
+  const { data: request } = await supabase.from("ceremony_requests").select("id,awarded_proposal_id,payment_status").eq("booking_id", bookingId).maybeSingle();
+  if (!request || request.payment_status === "paid") return;
+  if (request.awarded_proposal_id) {
+    await supabase.from("ceremony_proposals").update({ status: "rejected" }).eq("id", request.awarded_proposal_id);
+  }
+  await supabase.from("ceremony_requests").update({
+    status: "open",
+    awarded_proposal_id: null,
+    booking_id: null,
+    payment_status: "unpaid",
+    updated_at: now,
+  }).eq("id", request.id);
 }
 
 async function providerRequests(supabase: any, _body: any, identity: any) {
@@ -203,13 +316,46 @@ async function providerRequests(supabase: any, _body: any, identity: any) {
   return json({ requests: filtered.map((item: any) => mapProviderRequest({ ...item, pooja_name: poojaNames[item.pooja_slug] }, myProposals[item.id])) });
 }
 
+async function customerRequests(supabase: any, identity: any) {
+  const userId = identity.id;
+  if (!userId) return json({ requests: [] });
+  const { data: requests, error } = await supabase.from("ceremony_requests")
+    .select("id,pooja_slug,ceremony_date,ceremony_time,address,landmark,notes,budget_min_inr,budget_max_inr,status,payment_status,awarded_proposal_id,latitude,longitude,created_at")
+    .eq("customer_id", userId)
+    .order("created_at", { ascending: false });
+  if (error) throw error;
+  const poojaSlugs = [...new Set((requests || []).map((r: any) => r.pooja_slug).filter(Boolean))];
+  const { data: poojas } = poojaSlugs.length ? await supabase.from("poojas").select("slug,name").in("slug", poojaSlugs) : { data: [] };
+  const poojaNames = Object.fromEntries((poojas || []).map((p: any) => [p.slug, p.name]));
+  const requestIds = (requests || []).map((r: any) => r.id);
+  let proposalCounts: Record<string, number> = {};
+  if (requestIds.length) {
+    const { data: proposals } = await supabase.from("ceremony_proposals").select("request_id").in("request_id", requestIds);
+    (proposals || []).forEach((p: any) => {
+      proposalCounts[p.request_id] = (proposalCounts[p.request_id] || 0) + 1;
+    });
+  }
+  return json({
+    requests: (requests || []).map((r: any) => ({
+      ...r,
+      pooja_name: poojaNames[r.pooja_slug] || r.pooja_slug || "Ceremony",
+      proposal_count: proposalCounts[r.id] || 0,
+    })),
+  });
+}
+
 async function sendProposal(supabase: any, body: any, identity: any) {
+  if (!(await biddingEnabled(supabase))) return json({ error: "Proposals are currently disabled by the administrator" }, 409);
   const userId = identity.id;
   const requestId = cleanUuid(body.request_id);
   const amount = Number(body.amount_inr || body.amount || 0);
   if (!userId || !requestId || amount < 1) return json({ error: "Priest, request, and amount are required" }, 400);
-  const { data: priest } = await supabase.from("priest_profiles").select("id").eq("user_id", userId).maybeSingle();
+  const { data: priest } = await supabase.from("priest_profiles").select("id,display_name").eq("user_id", userId).maybeSingle();
   if (!priest) return json({ error: "Priest profile not found" }, 404);
+  const { data: request } = await supabase.from("ceremony_requests").select("id,customer_id,pooja_slug,status").eq("id", requestId).maybeSingle();
+  if (!request) return json({ error: "Request not found" }, 404);
+  if (request.status !== "open") return json({ error: "This request is no longer accepting quotes" }, 409);
+  const { data: existingProposal } = await supabase.from("ceremony_proposals").select("id").eq("request_id", requestId).eq("priest_id", priest.id).maybeSingle();
   const { data, error } = await supabase.from("ceremony_proposals").upsert({
     request_id: requestId,
     priest_id: priest.id,
@@ -220,7 +366,93 @@ async function sendProposal(supabase: any, body: any, identity: any) {
     updated_at: new Date().toISOString(),
   }, { onConflict: "request_id,priest_id" }).select("*").single();
   if (error) throw error;
+  const { data: pooja } = await supabase.from("poojas").select("name").eq("slug", request.pooja_slug).maybeSingle();
+  await notifyUsers(supabase, {
+    userIds: [request.customer_id],
+    type: existingProposal ? "proposal_updated" : "proposal_received",
+    title: existingProposal ? "A Purohit updated their quote" : "New quote for your pooja",
+    body: `${priest.display_name || "A verified Purohit"} quoted ${formatInr(amount)} for ${pooja?.name || "your ceremony"}.`,
+    requestId,
+  });
   return json({ proposal: data });
+}
+
+async function createBookingRequest(supabase: any, body: any, identity: any) {
+  if (identity.role !== "customer" && !isAdmin(identity)) return json({ error: "Customer account required" }, 403);
+  const priestId = cleanUuid(body.priest_id);
+  const poojaSlug = clean(body.pooja_slug);
+  if (!priestId || !poojaSlug) return json({ error: "Purohit and ceremony are required" }, 400);
+  if (!clean(body.booking_date) || !clean(body.booking_time) || !clean(body.address)) return json({ error: "Date, time, and address are required" }, 400);
+  const bookingDate = clean(body.booking_date);
+  const bookingTime = clean(body.booking_time);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(bookingDate) || bookingDate < new Date().toISOString().slice(0, 10) || !/^\d{2}:\d{2}$/.test(bookingTime)) return json({ error: "Choose a future date and valid time" }, 400);
+  const { data: priestProfile } = await supabase.from("priest_profiles").select("verification_status,is_listed,availability_notes").eq("id", priestId).maybeSingle();
+  if (!priestProfile || priestProfile.verification_status !== "verified" || !priestProfile.is_listed) return json({ error: "This priest profile is not available for direct booking" }, 409);
+  let availability: any = {};
+  try { availability = JSON.parse(priestProfile.availability_notes || "{}"); } catch { /* legacy note */ }
+  if (Array.isArray(availability.blocked) && availability.blocked.includes(bookingDate)) return json({ error: "This priest is unavailable on the selected date" }, 409);
+  if (Array.isArray(availability.slots?.[bookingDate]) && !availability.slots[bookingDate].includes(bookingTime)) return json({ error: "This time is not available for this priest" }, 409);
+  const { data: occupied } = await supabase.from("bookings").select("id").eq("priest_id", priestId).eq("booking_date", bookingDate).eq("booking_time", bookingTime).in("status", ["accepted", "confirmed", "in_progress"]).limit(1);
+  if (occupied?.length) return json({ error: "This priest already has a booking at that time" }, 409);
+
+  const { data: service } = await supabase.from("priest_services")
+    .select("price_paise,with_samagri_price_paise,additional_priest_price_paise,extra_service_label,extra_service_price_paise,is_active")
+    .eq("priest_id", priestId).eq("pooja_slug", poojaSlug).eq("is_active", true).maybeSingle();
+  if (!service) return json({ error: "This purohit has not published a price for the selected ceremony" }, 409);
+
+  const withSamagri = body.with_samagri === true;
+  const additionalPriest = body.additional_priest === true;
+  const extraService = body.extra_service === true;
+  if (withSamagri && service.with_samagri_price_paise == null) return json({ error: "Samagri option is unavailable" }, 409);
+  if (additionalPriest && service.additional_priest_price_paise == null) return json({ error: "Additional priest option is unavailable" }, 409);
+  if (extraService && service.extra_service_price_paise == null) return json({ error: "Additional service is unavailable" }, 409);
+  const feePercent = await getPlatformServiceFeePercent(supabase);
+  const basePaise = Number(withSamagri ? service.with_samagri_price_paise : service.price_paise);
+  const addonsPaise = Number(additionalPriest ? service.additional_priest_price_paise : 0) + Number(extraService ? service.extra_service_price_paise : 0);
+  const serviceFeePaise = Math.round((basePaise + addonsPaise) * feePercent / 10000) * 100;
+
+  const { data: customer } = await supabase.from("app_users").select("phone").eq("id", identity.id).maybeSingle();
+  const customerPhone = customer?.phone || clean(body.customer_phone);
+  if (!customerPhone) return json({ error: "Add a verified phone number to your profile before booking" }, 409);
+  if (!customer?.phone) {
+    await supabase.from("app_users").update({ phone: customerPhone, updated_at: new Date().toISOString() }).eq("id", identity.id);
+  }
+
+  const { data: duplicate } = await supabase.from("bookings").select("*")
+    .eq("customer_id", identity.id).eq("priest_id", priestId).eq("pooja_slug", poojaSlug)
+    .eq("booking_date", clean(body.booking_date)).eq("booking_time", clean(body.booking_time))
+    .in("status", ["pending", "accepted"])
+    .maybeSingle();
+  if (duplicate) return json({ booking: duplicate, reused: true });
+
+  const booking = await insertPendingBooking(supabase, {
+    customerId: identity.id,
+    priestId,
+    poojaSlug,
+    amountPaise: basePaise + addonsPaise + serviceFeePaise,
+    baseInr: basePaise / 100,
+    addonsTotalInr: addonsPaise / 100,
+    serviceFeeInr: serviceFeePaise / 100,
+    pricingOptions: { with_samagri: withSamagri, additional_priest: additionalPriest, extra_service: extraService, extra_service_label: extraService ? service.extra_service_label : null },
+    bookingDate,
+    bookingTime,
+    address: clean(body.address),
+    landmark: clean(body.landmark),
+    latitude: coordinate(body.latitude),
+    longitude: coordinate(body.longitude),
+    notes: clean(body.notes),
+    status: "pending",
+    paymentStatus: "unpaid",
+  });
+
+  await notifyUsers(supabase, {
+    userIds: [await priestUserId(supabase, priestId)],
+    type: "booking_request",
+    title: `New booking request: ${booking.pooja_name}`,
+    body: `${booking.customer_name} · ${booking.booking_date} ${String(booking.booking_time).slice(0, 5)} · ${formatInr(booking.total_inr)}. Accept or decline.`,
+    bookingId: booking.id,
+  });
+  return json({ booking });
 }
 
 async function createCashfreeOrder(supabase: any, body: any, identity: any) {
@@ -239,38 +471,36 @@ async function createCashfreeOrder(supabase: any, body: any, identity: any) {
     const { data: request } = await supabase.from("ceremony_requests").select("*").eq("id", requestId).maybeSingle();
     if (!request || request.customer_id !== identity.id) return json({ error: "Ceremony request not found" }, 404);
     proposalId = proposalId || request.awarded_proposal_id;
-    if (!proposalId) return json({ error: "Choose a proposal before checkout" }, 409);
-    const { data: proposal } = await supabase.from("ceremony_proposals").select("*").eq("id", proposalId).eq("request_id", requestId).eq("status", "accepted").maybeSingle();
-    if (!proposal) return json({ error: "The accepted proposal was not found" }, 404);
-    priestId = proposal.priest_id;
-    poojaSlug = request.pooja_slug;
-    amountPaise = Number(proposal.amount_inr) * 100;
-    bookingId = request.booking_id;
-    if (!bookingId) {
-      booking = await insertPendingBooking(supabase, {
-        customerId: identity.id,
-        priestId,
-        poojaSlug,
-        amountPaise,
-        bookingDate: request.ceremony_date,
-        bookingTime: request.ceremony_time,
-        address: request.address,
-        landmark: request.landmark,
-        latitude: request.latitude,
-        longitude: request.longitude,
-        notes: request.notes,
-      });
-      bookingId = booking.id;
-      await supabase.from("ceremony_requests").update({ booking_id: bookingId, updated_at: new Date().toISOString() }).eq("id", requestId);
+    if (!proposalId || !request.booking_id) return json({ error: "The Purohit has not accepted this request yet. You can pay once they accept." }, 409);
+    const { data: existingBooking } = await supabase.from("bookings").select("*").eq("id", request.booking_id).maybeSingle();
+    if (!existingBooking || existingBooking.customer_id !== identity.id) return json({ error: "Booking not found" }, 404);
+    if (existingBooking.payment_status === "paid") return json({ error: "This booking is already paid" }, 409);
+    if (existingBooking.status !== "accepted") {
+      const message = existingBooking.status === "pending"
+        ? "The Purohit has not accepted this request yet. You can pay once they accept."
+        : existingBooking.status === "rejected"
+          ? "The Purohit declined this request. Choose another proposal."
+          : `A ${existingBooking.status} booking cannot be paid`;
+      return json({ error: message }, 409);
     }
+    booking = existingBooking;
+    bookingId = existingBooking.id;
+    priestId = existingBooking.priest_id;
+    poojaSlug = existingBooking.pooja_slug;
+    amountPaise = Number(existingBooking.total_inr) * 100;
   } else if (bookingId) {
     const { data } = await supabase.from("bookings").select("*").eq("id", bookingId).maybeSingle();
     if (!data || data.customer_id !== identity.id) return json({ error: "Booking not found" }, 404);
+    const legacyPendingPayment = data.status === "pending" && data.payment_status !== "unpaid";
+    if (data.status !== "accepted" && !legacyPendingPayment) {
+      return json({ error: data.status === "pending" ? "The Purohit has not accepted this booking yet. You can pay once they accept." : `A ${data.status} booking cannot be paid` }, 409);
+    }
     booking = data;
     priestId = data.priest_id;
     poojaSlug = data.pooja_slug;
     amountPaise = Number(data.total_inr) * 100;
   } else {
+    // Older app builds still pay before the Purohit accepts; a decline on these is refunded automatically.
     priestId = cleanUuid(body.priest_id);
     if (!priestId || !poojaSlug) return json({ error: "Purohit and ceremony are required" }, 400);
     if (!clean(body.booking_date) || !clean(body.booking_time) || !clean(body.address)) return json({ error: "Date, time, and address are required" }, 400);
@@ -278,18 +508,22 @@ async function createCashfreeOrder(supabase: any, body: any, identity: any) {
       .select("price_paise,is_active")
       .eq("priest_id", priestId).eq("pooja_slug", poojaSlug).eq("is_active", true).maybeSingle();
     if (!service) return json({ error: "This purohit has not published a price for the selected ceremony" }, 409);
-    amountPaise = Number(service.price_paise);
+    const basePaise = Number(service.price_paise);
+    const serviceFeePaise = Math.round(basePaise * feePercent / 10000) * 100;
+    amountPaise = basePaise + serviceFeePaise;
     booking = await insertPendingBooking(supabase, {
       customerId: identity.id,
       priestId,
       poojaSlug,
       amountPaise,
+      baseInr: basePaise / 100,
+      serviceFeeInr: serviceFeePaise / 100,
       bookingDate: clean(body.booking_date),
       bookingTime: clean(body.booking_time),
       address: clean(body.address),
       landmark: clean(body.landmark),
-      latitude: numberOrNull(body.latitude),
-      longitude: numberOrNull(body.longitude),
+      latitude: coordinate(body.latitude),
+      longitude: coordinate(body.longitude),
       notes: clean(body.notes),
     });
     bookingId = booking.id;
@@ -305,7 +539,7 @@ async function createCashfreeOrder(supabase: any, body: any, identity: any) {
   if (!cashfreeConfigured()) return json({ error: "Cashfree is not configured on the server", code: "cashfree_not_configured" }, 503);
 
   const merchantOrderId = `PC_${crypto.randomUUID().replaceAll("-", "").slice(0, 28)}`;
-  const returnUrl = clean(Deno.env.get("CASHFREE_RETURN_URL")) || "https://purohit-marketplace-project.vercel.app/home?cashfree_order_id={order_id}";
+  const returnUrl = clean(Deno.env.get("CASHFREE_RETURN_URL")) || "https://bookingg.purohithconnect.com/bookings?order_id={order_id}";
   const notifyUrl = `${Deno.env.get("SUPABASE_URL")}/functions/v1/cashfree-webhook`;
   const { data: customer } = await supabase.from("app_users").select("full_name,email,phone").eq("id", identity.id).maybeSingle();
   let customerPhone = customer?.phone || clean(body.customer_phone);
@@ -350,8 +584,8 @@ async function createCashfreeOrder(supabase: any, body: any, identity: any) {
       fee_breakdown: {
         service_fee_percent: feePercent,
         gross_paise: amountPaise,
-        platform_fee_paise: Math.round(amountPaise * (feePercent / 100)),
-        net_paise: amountPaise - Math.round(amountPaise * (feePercent / 100)),
+        platform_fee_paise: Math.round(Number(booking?.service_fee_inr || 0) * 100) || Math.round(amountPaise * feePercent / (100 + feePercent)),
+        net_paise: amountPaise - (Math.round(Number(booking?.service_fee_inr || 0) * 100) || Math.round(amountPaise * feePercent / (100 + feePercent))),
       },
     },
   }).select("*").single();
@@ -407,8 +641,8 @@ async function insertPendingBooking(supabase: any, details: any) {
   ]);
   if (!priest || !pooja) throw new Error("Purohit or ceremony not found");
   const total = Math.round(Number(details.amountPaise) / 100);
-  const baseInr = details.baseInr || total;
-  const serviceFeeInr = details.serviceFeeInr || 0;
+  const baseInr = details.baseInr ?? total;
+  const serviceFeeInr = details.serviceFeeInr ?? 0;
   const subtotal = Math.round(total / 1.18);
   const { data, error } = await supabase.from("bookings").insert({
     customer_id: details.customerId,
@@ -424,8 +658,9 @@ async function insertPendingBooking(supabase: any, details: any) {
     subtotal_inr: subtotal,
     gst_inr: total - subtotal,
     total_inr: total,
-    status: "pending",
-    payment_status: "payment_pending",
+    status: details.status || "pending",
+    payment_status: details.paymentStatus || "payment_pending",
+    accepted_at: details.status === "accepted" ? new Date().toISOString() : null,
     customer_name: customer?.full_name || "Customer",
     customer_phone: customer?.phone || "",
     customer_email: customer?.email || "",
@@ -433,7 +668,8 @@ async function insertPendingBooking(supabase: any, details: any) {
     pooja_name: pooja.name,
     pooja_price_inr: baseInr,
     service_fee_inr: serviceFeeInr,
-    addons_total_inr: 0,
+    addons_total_inr: details.addonsTotalInr ?? 0,
+    pricing_options: details.pricingOptions || {},
     payment_provider: "cashfree",
   }).select("*").single();
   if (error) throw error;
@@ -466,6 +702,7 @@ async function markBookingPaid(supabase: any, order: any) {
   const invoiceNumber = booking.invoice_no || generatedInvoiceNumber;
   const invoiceHtml = renderCashfreeInvoice({ invoiceNumber, booking, order });
   await supabase.from("bookings").update({
+    ...(booking.status === "accepted" ? { status: "confirmed" } : {}),
     payment_status: "paid",
     payment_id: order.id,
     payment_provider: "cashfree",
@@ -479,7 +716,7 @@ async function markBookingPaid(supabase: any, order: any) {
   const feePercent = Number(order.metadata?.fee_breakdown?.service_fee_percent) || await getPlatformServiceFeePercent(supabase);
   const platformFee = typeof order.metadata?.fee_breakdown?.platform_fee_paise === "number"
     ? order.metadata.fee_breakdown.platform_fee_paise
-    : Math.round(Number(order.amount_paise) * (feePercent / 100));
+    : Math.round(Number(order.amount_paise) * feePercent / (100 + feePercent));
   await supabase.from("provider_earnings").upsert({
     booking_id: booking.id,
     payment_order_id: order.id,
@@ -526,7 +763,34 @@ async function markBookingPaid(supabase: any, order: any) {
       title: "Payment confirmed and invoice ready",
       body: `${booking.pooja_name || "Ceremony"} · ${invoiceNumber} · ₹${(Number(order.amount_paise) / 100).toLocaleString("en-IN")}`,
     });
+    await notifyPaymentConfirmed(supabase, booking, order);
   }
+}
+
+async function notifyPaymentConfirmed(supabase: any, booking: any, order: any) {
+  const amount = formatInr(Number(order.amount_paise) / 100);
+  const when = `${booking.booking_date} ${String(booking.booking_time || "").slice(0, 5)}`.trim();
+  const awaitingPriest = booking.status === "pending";
+  await Promise.all([
+    notifyUsers(supabase, {
+      userIds: [await priestUserId(supabase, order.priest_id)],
+      type: awaitingPriest ? "booking_request" : "payment_confirmed",
+      title: awaitingPriest ? `New paid booking: ${booking.pooja_name || "Ceremony"}` : `Booking confirmed: ${booking.pooja_name || "Ceremony"}`,
+      body: awaitingPriest
+        ? `${booking.customer_name || "A customer"} paid ${amount} for ${when}. Accept or decline it.`
+        : `${booking.customer_name || "The customer"} paid ${amount}. ${when}`,
+      bookingId: booking.id,
+    }),
+    notifyUsers(supabase, {
+      userIds: [order.customer_id],
+      type: "payment_confirmed",
+      title: awaitingPriest ? "Payment received" : "Payment received, booking confirmed",
+      body: awaitingPriest
+        ? `Waiting for ${booking.priest_name || "the Purohit"} to accept. You get a full refund if they decline.`
+        : `${booking.pooja_name || "Ceremony"} with ${booking.priest_name || "your Purohit"} · ${when}`,
+      bookingId: booking.id,
+    }),
+  ]);
 }
 
 async function listPaymentReports(supabase: any, identity: any) {
@@ -571,21 +835,89 @@ async function listBookings(supabase: any, identity: any) {
 async function providerBookingAction(supabase: any, body: any, identity: any) {
   const bookingId = cleanUuid(body.booking_id);
   const action = clean(body.booking_action);
-  if (!bookingId || !["accept", "reject", "complete"].includes(action)) return json({ error: "Valid booking action is required" }, 400);
+  if (!bookingId || !["accept", "reject", "start", "complete"].includes(action)) return json({ error: "Valid booking action is required" }, 400);
   const context = await trackingContext(supabase, bookingId, identity);
   if (!context || context.role !== "priest") return json({ error: "Only the assigned purohit can update this booking" }, 403);
-  if (action === "accept" && context.booking.payment_status !== "paid") return json({ error: "Payment must be confirmed before accepting this booking" }, 409);
-  const nextStatus = action === "accept" ? "confirmed" : action === "reject" ? "rejected" : "completed";
-  const allowed = action === "accept" ? ["pending"] : action === "reject" ? ["pending"] : ["confirmed"];
-  if (!allowed.includes(context.booking.status)) return json({ error: `A ${context.booking.status} booking cannot be ${nextStatus}` }, 409);
+  const paid = context.booking.payment_status === "paid";
+  const status = context.booking.status;
+  const allowed = action === "accept" ? status === "pending"
+    : action === "reject" ? status === "pending" || (status === "accepted" && !paid)
+    : action === "start" ? status === "confirmed" && paid
+    : status === "in_progress" && paid;
+  const nextStatus = action === "accept" ? (paid ? "confirmed" : "accepted") : action === "reject" ? "rejected" : action === "start" ? "in_progress" : "completed";
+  if (!allowed) return json({ error: `A ${status} booking cannot be ${nextStatus}` }, 409);
   const now = new Date().toISOString();
-  const { data, error } = await supabase.from("bookings").update({ status: nextStatus, updated_at: now }).eq("id", bookingId).select("*").single();
+  const reason = clean(body.reason).slice(0, 500);
+  const updates: Record<string, unknown> = { status: nextStatus, updated_at: now };
+  if (nextStatus === "accepted" || nextStatus === "confirmed") updates.accepted_at = now;
+  if (nextStatus === "rejected") {
+    updates.rejected_at = now;
+    if (reason) updates.rejected_reason = reason;
+  }
+  if (nextStatus === "completed") updates.completed_at = now;
+  if (nextStatus === "in_progress") { updates.started_at = now; updates.started_by = identity.id; }
+  const { data, error } = await supabase.from("bookings").update(updates).eq("id", bookingId).eq("status", status).select("*").maybeSingle();
   if (error) throw error;
+  if (!data) return json({ error: "Booking status changed. Refresh and try again." }, 409);
+  if (action === "start" || action === "complete") {
+    const { error: eventError } = await supabase.from("booking_job_events").insert({
+      booking_id: bookingId, actor_id: identity.id, action, from_status: status, to_status: nextStatus,
+    });
+    if (eventError && eventError.code !== "23505") throw eventError;
+  }
   if (action === "complete") {
     await supabase.from("provider_earnings").update({ status: "available", available_at: now, updated_at: now }).eq("booking_id", bookingId).eq("status", "held");
     await supabase.from("booking_tracking_sessions").update({ status: "stopped", stopped_at: now, updated_at: now }).eq("booking_id", bookingId);
   }
-  return json({ booking: data });
+  let refund = null;
+  if (action === "reject" && paid) refund = await refundPaidBooking(supabase, data, reason || "Purohit declined the booking");
+  if (!paid && action === "accept") await confirmAwardedProposal(supabase, bookingId);
+  if (!paid && action === "reject") await releaseRejectedProposal(supabase, bookingId, now);
+
+  const pooja = data.pooja_name || "your ceremony";
+  const priestName = data.priest_name || "The Purohit";
+  const when = `${data.booking_date} ${String(data.booking_time || "").slice(0, 5)}`.trim();
+  const message = action === "accept"
+    ? paid
+      ? { type: "booking_confirmed", title: "Booking confirmed", body: `${priestName} confirmed ${pooja} on ${when}.` }
+      : { type: "booking_accepted", title: "Purohit accepted. Complete payment", body: `${priestName} accepted ${pooja} on ${when}. Pay ${formatInr(data.total_inr)} to confirm.` }
+    : action === "reject"
+      ? { type: "booking_rejected", title: "Booking request declined", body: `${priestName} can't take ${pooja} on ${when}.${refund?.status === "initiated" ? " Your refund has been started." : ""} Try another Purohit.` }
+      : action === "start"
+        ? { type: "booking_started", title: "Ceremony started", body: `${priestName} has started ${pooja}. You can follow its status in My Bookings.` }
+        : { type: "booking_completed", title: "Ceremony completed", body: `${pooja} with ${priestName} is marked complete. Share a review!` };
+  await notifyUsers(supabase, { userIds: [data.customer_id, await priestUserId(supabase, data.priest_id)], bookingId, ...message });
+  return json({ booking: data, refund });
+}
+
+async function refundPaidBooking(supabase: any, booking: any, reason: string) {
+  const { data: order } = await supabase.from("payment_orders").select("*")
+    .eq("booking_id", booking.id).eq("status", "paid").maybeSingle();
+  if (!order) return { status: "no_paid_order" };
+  const refundId = `RF_${crypto.randomUUID().replaceAll("-", "").slice(0, 28)}`;
+  const amountInr = Number(order.amount_paise) / 100;
+  const now = new Date().toISOString();
+  try {
+    await cashfreeRequest(`/orders/${encodeURIComponent(order.merchant_order_id)}/refunds`, {
+      method: "POST",
+      body: { refund_amount: amountInr, refund_id: refundId, refund_note: reason.slice(0, 100).padEnd(3, ".") },
+      idempotencyKey: refundId,
+    });
+    await supabase.from("bookings").update({
+      payment_status: "refund_pending",
+      refund_id: refundId,
+      refund_amount_inr: Math.round(amountInr),
+      refund_reason: reason,
+      updated_at: now,
+    }).eq("id", booking.id);
+    return { status: "initiated", refund_id: refundId };
+  } catch (error) {
+    await supabase.from("bookings").update({
+      refund_reason: `Automatic refund failed, admin action required: ${String((error as Error)?.message || error).slice(0, 300)}`,
+      updated_at: now,
+    }).eq("id", booking.id);
+    return { status: "failed" };
+  }
 }
 
 async function trackingContext(supabase: any, bookingId: string, identity: any) {
@@ -703,10 +1035,15 @@ async function getPlatformServiceFeePercent(supabase: any): Promise<number> {
       .maybeSingle();
     if (error || !data?.value) return 10;
     const parsed = Number(data.value);
-    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 10;
+    return parsed === 5 || parsed === 10 ? parsed : 10;
   } catch {
     return 10;
   }
+}
+
+async function biddingEnabled(supabase: any): Promise<boolean> {
+  const { data, error } = await supabase.from("platform_settings").select("value").eq("key", "booking_bidding_enabled").maybeSingle();
+  return !error && data?.value === "true";
 }
 
 function cashfreeConfigured() {
@@ -796,6 +1133,8 @@ async function loadRequestContext(supabase: any, requestId: string) {
     ...data,
     priest_id: proposal?.priest_id || data.priest_id,
     customer_name: data.app_users?.full_name,
+    customer_phone: data.app_users?.phone,
+    customer_email: data.app_users?.email,
     pooja_name: pooja?.name,
   };
 }
@@ -904,24 +1243,14 @@ function mapProviderRequest(row: any, proposal: any) {
   };
 }
 
-function renderInvoice(details: any) {
-  const issuedAt = new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
-  return `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(details.invoiceNumber)}</title><style>body{font-family:Inter,Arial,sans-serif;margin:0;background:#f7f4ef;color:#1f1f1d}.invoice{max-width:760px;margin:32px auto;background:#fff;border:1px solid #e6ded2;border-radius:22px;padding:34px}.brand{display:flex;justify-content:space-between;gap:20px;border-bottom:1px solid #eee2d8;padding-bottom:20px}.name{font-size:24px;font-weight:800}.badge{background:#fff1eb;color:#d84616;border-radius:999px;padding:8px 12px;font-weight:800;font-size:12px}.row{display:flex;justify-content:space-between;border-bottom:1px solid #f0ebe5;padding:14px 0}.muted{color:#6d6861}.total{font-size:28px;font-weight:900}.note{margin-top:22px;padding:16px;background:#fff8f4;border-radius:16px;color:#5d5650}</style></head><body><main class="invoice"><section class="brand"><div><div class="name">Purohith Connect</div><div class="muted">AI-assisted UPI payment acknowledgement</div></div><div class="badge">${escapeHtml(details.status)}</div></section><section><div class="row"><span>Invoice number</span><strong>${escapeHtml(details.invoiceNumber)}</strong></div><div class="row"><span>Issued at</span><strong>${escapeHtml(issuedAt)}</strong></div><div class="row"><span>Customer</span><strong>${escapeHtml(details.customerName)}</strong></div><div class="row"><span>Ceremony</span><strong>${escapeHtml(details.poojaName)}</strong></div><div class="row"><span>Date and time</span><strong>${escapeHtml(`${details.ceremonyDate} ${details.ceremonyTime}`)}</strong></div><div class="row"><span>Address</span><strong>${escapeHtml(details.address)}</strong></div><div class="row"><span>UPI paid to</span><strong>${escapeHtml(details.upiId)}</strong></div><div class="row"><span>Total</span><strong class="total">₹${Number(details.amount).toLocaleString("en-IN")}</strong></div></section><p class="note">This invoice is generated from a customer-uploaded UPI screenshot. Admin verification is required before provider assignment or payout release.</p></main></body></html>`;
-}
-
 function renderCashfreeInvoice({ invoiceNumber, booking, order }: any) {
-  return renderInvoice({
+  return renderBookingInvoice({
     invoiceNumber,
-    amount: Number(order.amount_paise) / 100,
-    customerName: booking.customer_name,
-    poojaName: booking.pooja_name,
-    ceremonyDate: booking.booking_date,
-    ceremonyTime: booking.booking_time,
-    address: booking.address,
-    upiId: "Cashfree Payments",
-    status: "PAID",
-  }).replace("AI-assisted UPI payment acknowledgement", "Cashfree verified payment receipt")
-    .replace("This invoice is generated from a customer-uploaded UPI screenshot. Admin verification is required before provider assignment or payout release.", "Payment status was verified against Cashfree. Provider earnings remain held until the ceremony is completed and an administrator approves release.");
+    booking,
+    amountInr: Number(order.amount_paise) / 100,
+    issuedAt: booking.invoice_issued_at || order.paid_at,
+    payment: { mode: "Online (Cashfree)", status: "paid", reference: order.merchant_order_id, paidAt: order.paid_at },
+  });
 }
 
 function makeInvoiceNumber() {
@@ -947,13 +1276,15 @@ function numberOrNull(value: unknown) {
   return Number.isFinite(n) && n > 0 ? Math.round(n) : null;
 }
 
-function nullableNumber(value: unknown) {
+function coordinate(value: unknown) {
+  if (value === null || value === undefined || value === "") return null;
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
 }
 
-function escapeHtml(value: unknown) {
-  return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#039;" }[char] || char));
+function nullableNumber(value: unknown) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
 }
 
 async function getIdentity(req: Request, supabase: any) {
